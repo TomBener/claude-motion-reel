@@ -1,0 +1,452 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face{font-family:'G';src:url('fonts/GeistVar.ttf') format('truetype');font-weight:100 900;}
+@font-face{font-family:'GM';src:url('fonts/GeistMono-Regular.otf');font-weight:400;}
+@font-face{font-family:'GM';src:url('fonts/GeistMono-Medium.otf');font-weight:500;}
+html,body{margin:0;background:#000}
+canvas{display:block}
+</style></head>
+<body><canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const W = 1920, H = 1080, FPS = 60;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const BG = '#0B0B0C', INK = '#F2EEE6', ACC = '#FF5B1F', CELL = '#151517';
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const P = (t, a, b) => clamp((t - a) / (b - a));
+const TAU = Math.PI * 2;
+const E = {
+  o3: x => 1 - Math.pow(1 - x, 3),
+  i3: x => x * x * x,
+  io3: x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2,
+  o5: x => 1 - Math.pow(1 - x, 5),
+  oExpo: x => x >= 1 ? 1 : 1 - Math.pow(2, -10 * x),
+  iExpo: x => x <= 0 ? 0 : Math.pow(2, 10 * x - 10),
+  ioExpo: x => x <= 0 ? 0 : x >= 1 ? 1 : x < .5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2,
+  oBack: (x, s = 1.70158) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2),
+  oElastic: x => x <= 0 ? 0 : x >= 1 ? 1 : Math.pow(2, -10 * x) * Math.sin((x * 10 - .75) * (TAU / 3)) + 1,
+  oBounce: x => { const n = 7.5625, d = 2.75;
+    if (x < 1 / d) return n * x * x;
+    if (x < 2 / d) return n * (x -= 1.5 / d) * x + .75;
+    if (x < 2.5 / d) return n * (x -= 2.25 / d) * x + .9375;
+    return n * (x -= 2.625 / d) * x + .984375; },
+};
+function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const F = (w, s) => `${w} ${s}px G`;
+const M = (s, w = 500) => `${w} ${s}px GM`;
+const D = s => `italic ${s}px Didot`;
+function reset() { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.letterSpacing = '0px'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.filter = 'none'; }
+function mk(w = W, h = H) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function fit(text, weight, maxW, maxS, ls = 0) { ctx.save(); ctx.font = F(weight, 100); ctx.letterSpacing = (ls * 100) + 'px';
+  const w = ctx.measureText(text).width; ctx.restore(); return Math.min(maxS, 100 * maxW / w); }
+function capBox(font, text, ls = '0px') { ctx.save(); ctx.font = font; ctx.letterSpacing = ls; const m = ctx.measureText(text); ctx.restore();
+  return { w: m.width, a: m.actualBoundingBoxAscent, d: m.actualBoundingBoxDescent }; }
+
+// ---------- precomputed ----------
+const OFF = mk(), octx = OFF.getContext('2d');
+let GRAIN = [], PARTS = [];
+async function init() {
+  await Promise.all([document.fonts.load(F(900, 100)), document.fonts.load(F(100, 100)), document.fonts.load(M(20, 400)),
+    document.fonts.load(M(20, 500)), document.fonts.load(D(100))]);
+  // grain tiles
+  for (let g = 0; g < 8; g++) {
+    const c = mk(512, 512), x = c.getContext('2d'), id = x.createImageData(512, 512), r = rng(1000 + g);
+    for (let i = 0; i < id.data.length; i += 4) { const v = r() * 255; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 22; }
+    x.putImageData(id, 0, 0); GRAIN.push(ctx.createPattern(c, 'repeat'));
+  }
+  // particle targets from the word
+  const c = mk(), x = c.getContext('2d'); const s = fit('CLAUDE', 900, 1480, 420, -0.04);
+  x.font = F(900, s); x.letterSpacing = (-0.04 * s) + 'px'; x.textAlign = 'center'; x.fillStyle = '#fff';
+  const m = x.measureText('CLAUDE'); x.fillText('CLAUDE', W / 2, H / 2 + m.actualBoundingBoxAscent / 2 - 10);
+  const d = x.getImageData(0, 0, W, H).data, r = rng(7), step = 7;
+  for (let yy = 0; yy < H; yy += step) for (let xx = 0; xx < W; xx += step) {
+    const jx = xx + (r() - .5) * 3, jy = yy + (r() - .5) * 3;
+    if (d[((jy | 0) * W + (jx | 0)) * 4 + 3] > 128) PARTS.push({ tx: jx, ty: jy });
+  }
+  for (const p of PARTS) { p.ang = r() * TAU; p.rad = 180 + Math.pow(r(), .6) * 1100; p.dl = r() * .22 + (p.tx / W) * .18;
+    p.acc = r() < .13; p.big = r() < .3; p.ph = r() * TAU; p.ex = .6 + r() * 1.2; }
+}
+window.ready = init();
+
+// ---------- scene 1: dot → line → slab → MOTION ----------
+function s1(lt) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2 - 30;
+  const ls = lerp(-0.05, 0.05, E.io3(P(lt, 1.3, 1.72)));
+  const wt = lerp(900, 140, E.io3(P(lt, 1.3, 1.72)));
+  const size = fit('MOTION', 900, 1500, 420, -0.05);
+  const font = F(wt, size), lsp = (ls * size) + 'px';
+  const bx = capBox(F(900, size), 'MOTION');
+  const top = cy - bx.a / 2 - 24, bot = cy + bx.a / 2 + 24, N = 7, sh = (bot - top) / N;
+  // text layer on offscreen
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, W, H);
+  octx.font = font; octx.letterSpacing = lsp; octx.textAlign = 'center'; octx.fillStyle = INK;
+  octx.fillText('MOTION', cx, cy + bx.a / 2);
+  for (let i = 0; i < N; i++) {
+    const dir = i % 2 ? 1 : -1, y0 = top + i * sh;
+    const inn = E.oExpo(P(lt, .95 + i * .035, 1.33 + i * .035));
+    const out = E.iExpo(P(lt, 1.78 + i * .02, 1.98));
+    const off = (1 - inn) * dir * 1100 - out * dir * 2100;
+    if (inn > 0) ctx.drawImage(OFF, 0, y0, W, sh + 1, off, y0, W, sh + 1);
+  }
+  // accent: dot → line → slab → strips
+  ctx.fillStyle = ACC;
+  if (lt < .95) {
+    const pd = E.oBack(P(lt, .04, .3), 2.6), pl = E.ioExpo(P(lt, .3, .72)), pv = E.oExpo(P(lt, .7, .95));
+    const w = Math.max(24 * pd, lerp(24, 1560, pl)), h = lerp(lerp(24 * pd, 8, pl), bot - top, pv);
+    ctx.beginPath(); ctx.roundRect(cx - w / 2, cy - h / 2, w, h, Math.min(h / 2, 12 * (1 - pv) + 0.01)); ctx.fill();
+  } else {
+    for (let i = 0; i < N; i++) {
+      const dir = i % 2 ? 1 : -1, y0 = top + i * sh, p = E.ioExpo(P(lt, .95 + i * .035, 1.35 + i * .035));
+      if (p < 1) ctx.fillRect(cx - 780 - p * dir * 2000, y0, 1560, sh + 1);
+    }
+  }
+  // caption typing
+  const cap = 'A SHOWREEL BY CLAUDE  —  RENDERED IN PURE CODE';
+  const n = Math.floor(cap.length * P(lt, 1.15, 1.6)), fade = 1 - P(lt, 1.8, 1.95);
+  if (n > 0 && fade > 0) {
+    ctx.globalAlpha = fade; ctx.font = M(22); ctx.letterSpacing = '4px'; ctx.textAlign = 'center'; ctx.fillStyle = INK;
+    const full = ctx.measureText(cap).width, str = cap.slice(0, n);
+    ctx.textAlign = 'left'; ctx.fillText(str, cx - full / 2, bot + 110);
+    const cw = ctx.measureText(str).width;
+    if (n < cap.length || Math.floor(lt * 8) % 2 === 0) { ctx.fillStyle = ACC; ctx.fillRect(cx - full / 2 + cw + 4, bot + 90, 13, 24); }
+  }
+  return INK;
+}
+
+// ---------- scene 2: principles that do what they say ----------
+const WORDS = [['SQUASH', ACC, BG], ['OVERSHOOT', BG, ACC], ['SPACING', INK, BG], ['WEIGHT', ACC, BG]];
+function s2(lt) {
+  const k = Math.min(3, Math.floor(lt / .5)), u = lt - k * .5, [word, bg, fg] = WORDS[k];
+  const cx = W / 2, cy = H / 2;
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  // outlined marquee
+  ctx.save(); ctx.font = F(900, 150); ctx.letterSpacing = '-4px'; ctx.strokeStyle = fg; ctx.globalAlpha = .15; ctx.lineWidth = 2;
+  const str = word + ' — ', tw = ctx.measureText(str).width;
+  for (let r = 0; r < 8; r++) {
+    const y = r * 148 + 20, dir = r % 2 ? 1 : -1, off = (((lt * 420 * dir + r * 311) % tw) + tw) % tw;
+    for (let x = off - tw; x < W; x += tw) ctx.strokeText(str, x, y + 118);
+  }
+  ctx.restore();
+  ctx.fillStyle = fg; ctx.strokeStyle = fg; ctx.textAlign = 'center';
+  if (k === 0) { // SQUASH & stretch on impact
+    const s = fit(word, 900, 1150, 320, -0.03), bx = capBox(F(900, s), word), base = cy + bx.a / 2;
+    let y, sx, sy;
+    if (u < .16) { const f = E.i3(P(u, 0, .16)); y = lerp(-80, base, f); sx = lerp(1, .82, f); sy = lerp(1, 1.25, f); }
+    else { const v = u - .16, q = Math.exp(-v * 11) * Math.cos(v * 30); y = base; sx = 1 + .32 * q; sy = 1 - .42 * q; }
+    ctx.save(); ctx.translate(cx, y); ctx.scale(sx, sy); ctx.font = F(900, s); ctx.letterSpacing = (-0.03 * s) + 'px'; ctx.fillText(word, 0, 0); ctx.restore();
+    if (u > .16) { const v = P(u, .16, .42); ctx.save(); ctx.globalAlpha = 1 - v; ctx.lineWidth = 5; ctx.lineCap = 'round';
+      for (let i = 0; i < 14; i++) { const a = Math.PI + (i / 13) * Math.PI, side = i < 7 ? -1 : 1;
+        const ox = cx + side * bx.w * .62 * sx, r0 = 30 + E.oExpo(v) * 90, r1 = r0 + 30 * (1 - v);
+        ctx.beginPath(); ctx.moveTo(ox + Math.cos(a) * r0 * .7, base + Math.sin(a) * r0 * .5); ctx.lineTo(ox + Math.cos(a) * r1 * .7, base + Math.sin(a) * r1 * .5); ctx.stroke(); }
+      ctx.restore(); }
+  } else if (k === 1) { // OVERSHOOT with onion skins
+    const s = fit(word, 900, 1500, 320, -0.03), bx = capBox(F(900, s), word);
+    for (let g = 4; g >= 0; g--) {
+      const uu = u - g * .035; if (uu < 0) continue;
+      const p = P(uu, 0, .34), sc = E.oBack(p, 3.4), rot = (1 - E.oBack(p, 2.2)) * -.22;
+      ctx.save(); ctx.translate(cx, cy); ctx.rotate(rot); ctx.scale(sc, sc); ctx.font = F(900, s); ctx.letterSpacing = (-0.03 * s) + 'px';
+      if (g) { ctx.globalAlpha = .38 / g; ctx.lineWidth = 2 / Math.max(sc, .1); ctx.strokeText(word, 0, bx.a / 2); } else ctx.fillText(word, 0, bx.a / 2);
+      ctx.restore();
+    }
+  } else if (k === 2) { // SPACING with a spacing chart
+    const s = 230; ctx.font = F(900, s); const ws = [...word].map(ch => ctx.measureText(ch).width);
+    const gap = lerp(-26, 64, E.oExpo(P(u, .02, .4))), total = ws.reduce((a, b) => a + b, 0) + gap * (ws.length - 1);
+    const bx = capBox(F(900, s), word), base = cy + bx.a / 2 - 20; let x = cx - total / 2;
+    ctx.textAlign = 'left';
+    for (let i = 0; i < ws.length; i++) {
+      const a = E.o3(P(u, i * .025, .12 + i * .025)); ctx.globalAlpha = a;
+      ctx.font = F(900, s); ctx.fillText(word[i], x, base + (1 - a) * 60);
+      if (i < ws.length - 1) { const gx = x + ws[i], ga = P(u, .12, .22); ctx.globalAlpha = ga; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(gx, base + 40); ctx.lineTo(gx, base + 70); ctx.moveTo(gx + gap, base + 40); ctx.lineTo(gx + gap, base + 70);
+        ctx.moveTo(gx, base + 55); ctx.lineTo(gx + gap, base + 55); ctx.stroke();
+        ctx.font = M(16); ctx.textAlign = 'center'; ctx.fillText((gap >= 0 ? '+' : '') + Math.round(gap), gx + gap / 2, base + 100); ctx.textAlign = 'left'; }
+      x += ws[i] + gap;
+    }
+    ctx.globalAlpha = 1;
+  } else { // WEIGHT: variable font axis
+    const p = E.oExpo(P(u, 0, .36)), wt = lerp(100, 900, p), s = fit(word, 900, 1400, 320, -0.02), bx = capBox(F(900, s), word);
+    const drop = -70 * (1 - E.oBounce(P(u, 0, .42)));
+    ctx.font = F(wt, s); ctx.letterSpacing = (-0.02 * s) + 'px'; ctx.fillText(word, cx, cy + bx.a / 2 + drop - 30);
+    const y = cy + bx.a / 2 + 70, x0 = cx - 300, x1 = cx + 300; ctx.lineWidth = 2; ctx.globalAlpha = .35;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke(); ctx.globalAlpha = 1; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(lerp(x0, x1, p), y); ctx.stroke();
+    ctx.beginPath(); ctx.arc(lerp(x0, x1, p), y, 10, 0, TAU); ctx.fill();
+    ctx.font = M(18); ctx.letterSpacing = '3px'; ctx.textAlign = 'left'; ctx.fillText('WGHT', x0 - 110, y + 6);
+    ctx.textAlign = 'right'; ctx.fillText(String(Math.round(wt)).padStart(3, '0'), x1 + 90, y + 6);
+  }
+  ctx.globalAlpha = 1; ctx.font = M(18); ctx.letterSpacing = '5px'; ctx.textAlign = 'center';
+  ctx.fillText(`PRINCIPLE 0${k + 1} / 04`, cx, 170);
+  return fg;
+}
+
+// ---------- scene 3: a field of shapes ----------
+function s3(lt) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2, cols = 19, rows = 11, sp = 104;
+  const cam = E.oExpo(P(lt, 0, 1.3));
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(lerp(-.18, 0, cam)); ctx.scale(lerp(1.3, 1, cam), lerp(1.3, 1, cam));
+  const m1 = E.io3(P(lt, .75, 1.1)), m2 = E.io3(P(lt, 1.15, 1.45)), m3 = E.io3(P(lt, 1.5, 1.85));
+  const col = E.iExpo(P(lt, 2.02, 2.42));
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const gx = (i - (cols - 1) / 2) * sp, gy = (j - (rows - 1) / 2) * sp, d = Math.hypot(gx, gy) / 1100;
+    const app = E.oBack(P(lt, d * .45, d * .45 + .4), 2.2);
+    const ph = lt * 6.2 - d * 9, wv = .5 + .5 * Math.sin(ph);
+    let sz = 70 * app * lerp(.3, 1, wv) * (1 - col * .9);
+    if (sz <= .5) continue;
+    const x = lerp(gx, 0, col), y = lerp(gy, 0, col);
+    const fa = Math.atan2(gy, gx) + Math.PI / 2 + Math.sin(lt * 3 + d * 5) * .8;
+    const rot = lerp(lerp(0, Math.PI / 4, m2), fa, m3) + lt * .4 * m1;
+    const w = sz, h = lerp(sz, sz * .16, m3), rr = lerp(Math.min(w, h) / 2, 3, m1);
+    ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = Math.sin(ph) > .82 ? ACC : INK;
+    ctx.beginPath(); ctx.roundRect(-w / 2, -h / 2, w, h, Math.max(0, Math.min(rr, w / 2, h / 2))); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+  const dot = E.oBack(P(lt, 2.3, 2.46), 3);
+  if (dot > 0) { ctx.fillStyle = ACC; ctx.beginPath(); ctx.arc(cx, cy, 14 * dot, 0, TAU); ctx.fill(); }
+  // equation readout
+  const a = E.o3(P(lt, .5, .9)) * (1 - P(lt, 2.0, 2.2));
+  if (a > 0) { ctx.globalAlpha = a; ctx.fillStyle = BG; ctx.font = M(20); ctx.letterSpacing = '2px'; ctx.textAlign = 'center';
+    const txt = 'f(x, y, t) = sin(6.2t − 9‖p‖)', tw = ctx.measureText(txt).width;
+    ctx.fillRect(cx - tw / 2 - 22, 128, tw + 44, 46); ctx.fillStyle = INK; ctx.fillText(txt, cx, 158); ctx.globalAlpha = 1; }
+  return INK;
+}
+
+// ---------- scene 4: particles assemble the name ----------
+function ppos(p, lt) {
+  const cx = W / 2, cy = H / 2;
+  const b = E.oExpo(P(lt, 0, .9)), sw = 1.1 * E.o3(P(lt, 0, 1.3)) * (p.rad / 1200);
+  let bx = Math.cos(p.ang + sw) * p.rad * b, by = Math.sin(p.ang + sw) * p.rad * b * .6;
+  bx += cx; by += cy;
+  const c = E.ioExpo(P(lt, .5 + p.dl, 1.3 + p.dl));
+  let x = lerp(bx, p.tx, c), y = lerp(by, p.ty, c);
+  x += Math.sin(lt * 7 + p.ph) * 1.6 * c; y += Math.cos(lt * 6 + p.ph) * 1.6 * c;
+  const e = E.iExpo(P(lt, 1.9 + p.dl * .5, 2.5));
+  x += e * (1500 + p.ex * 1500); y += e * Math.sin(p.ph) * 160 - e * 80;
+  return [x, y];
+}
+function s4(lt) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const sh = .03;
+  const groups = [[INK, 1.6, false], [INK, 3, true], [ACC, 2, false], [ACC, 3.4, true]];
+  ctx.lineCap = 'round';
+  for (const [col, lw, big] of groups) {
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+    for (const p of PARTS) { if (p.acc !== (col === ACC) || p.big !== big) continue;
+      const [x0, y0] = ppos(p, Math.max(0, lt - sh)), [x1, y1] = ppos(p, lt);
+      ctx.moveTo(x0, y0); ctx.lineTo(x1 + .01, y1); }
+    ctx.stroke();
+  }
+  const a = E.o3(P(lt, 1.35, 1.6)) * (1 - P(lt, 1.9, 2.1));
+  if (a > 0) { ctx.globalAlpha = a; ctx.fillStyle = INK; ctx.font = M(20); ctx.letterSpacing = '5px'; ctx.textAlign = 'center';
+    ctx.fillText(`${PARTS.length.toLocaleString('en-US')} PARTICLES  ·  ONE NAME`, W / 2, H / 2 + 250); ctx.globalAlpha = 1; }
+  return INK;
+}
+
+// ---------- scene 5: the curve ----------
+const BZ = [.16, 1, .3, 1];
+function bez(s, a, b) { return 3 * (1 - s) * (1 - s) * s * a + 3 * (1 - s) * s * s * b + s * s * s; }
+function ease(x) { let lo = 0, hi = 1; for (let i = 0; i < 24; i++) { const m = (lo + hi) / 2; if (bez(m, BZ[0], BZ[2]) < x) lo = m; else hi = m; }
+  return bez((lo + hi) / 2, BZ[1], BZ[3]); }
+function s5(lt) {
+  ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+  const gx = 170, gy = 250, gw = 640, gh = 560, X = v => gx + v * gw, Y = v => gy + gh - v * gh;
+  const pin = E.oExpo(P(lt, 0, .5));
+  ctx.save(); ctx.translate(-(1 - pin) * 200, 0); ctx.globalAlpha = pin;
+  // grid
+  ctx.strokeStyle = BG; ctx.lineWidth = 1;
+  for (let i = 0; i <= 10; i++) { ctx.globalAlpha = pin * (i % 5 ? .08 : .2);
+    ctx.beginPath(); ctx.moveTo(X(i / 10), gy); ctx.lineTo(X(i / 10), gy + gh); ctx.moveTo(gx, Y(i / 10)); ctx.lineTo(gx + gw, Y(i / 10)); ctx.stroke(); }
+  ctx.globalAlpha = pin; ctx.fillStyle = BG; ctx.font = M(16); ctx.letterSpacing = '3px';
+  ctx.fillText('VALUE', gx, gy - 22); ctx.textAlign = 'right'; ctx.fillText('TIME →', gx + gw, gy + gh + 40); ctx.textAlign = 'left';
+  ctx.font = M(20); ctx.fillText('cubic-bezier(0.16, 1, 0.3, 1)', gx, gy + gh + 90);
+  // handles
+  const hp = E.oBack(P(lt, .45, .75), 2.5);
+  ctx.strokeStyle = BG; ctx.lineWidth = 2; ctx.globalAlpha = pin * clamp(hp);
+  const h1 = [lerp(X(0), X(BZ[0]), hp), lerp(Y(0), Y(BZ[1]), hp)], h2 = [lerp(X(1), X(BZ[2]), hp), lerp(Y(1), Y(BZ[3]), hp)];
+  ctx.beginPath(); ctx.moveTo(X(0), Y(0)); ctx.lineTo(...h1); ctx.moveTo(X(1), Y(1)); ctx.lineTo(...h2); ctx.stroke();
+  for (const h of [h1, h2]) { ctx.beginPath(); ctx.arc(h[0], h[1], 10, 0, TAU); ctx.fillStyle = INK; ctx.fill(); ctx.stroke(); }
+  ctx.globalAlpha = pin;
+  // curve
+  const cd = E.io3(P(lt, .1, .6)); ctx.strokeStyle = ACC; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i <= 200 * cd; i++) { const s = i / 200, x = X(bez(s, BZ[0], BZ[2])), y = Y(bez(s, BZ[1], BZ[3])); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.stroke();
+  // keyframes
+  for (const [v, d] of [[0, 0], [1, .12]]) { const k = E.oBack(P(lt, d, d + .3), 3); if (k <= 0) continue;
+    ctx.save(); ctx.translate(X(v), Y(v)); ctx.rotate(Math.PI / 4); ctx.scale(k, k); ctx.fillStyle = BG; ctx.fillRect(-11, -11, 22, 22); ctx.restore(); }
+  // playhead
+  const tp = P(lt, .75, 1.55), val = ease(tp);
+  if (lt > .75) { ctx.strokeStyle = BG; ctx.lineWidth = 2; ctx.globalAlpha = .5; ctx.beginPath(); ctx.moveTo(X(tp), gy); ctx.lineTo(X(tp), gy + gh); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.fillStyle = ACC; ctx.beginPath(); ctx.arc(X(tp), Y(val), 14, 0, TAU); ctx.fill();
+    ctx.fillStyle = BG; ctx.font = M(16); ctx.fillText(`t ${tp.toFixed(2)}  v ${val.toFixed(2)}`, X(tp) + 22, Y(val) + 36); }
+  ctx.restore();
+  // spacing track
+  const tx0 = 1000, tx1 = 1740, ty = 420, ta = E.oExpo(P(lt, .2, .6));
+  ctx.globalAlpha = ta; ctx.strokeStyle = BG; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(tx0, ty + 70); ctx.lineTo(lerp(tx0, tx1, ta), ty + 70); ctx.stroke();
+  for (let i = 0; i <= 16; i++) { const v = ease(i / 16), x = lerp(tx0, tx1, v), on = lt > .75 + (i / 16) * .8;
+    ctx.globalAlpha = ta * (on ? .9 : .15); ctx.beginPath(); ctx.moveTo(x, ty + 58); ctx.lineTo(x, ty + 82); ctx.stroke();
+    if (on && i < 16) { ctx.globalAlpha = .22; ctx.beginPath(); ctx.arc(x, ty, 34, 0, TAU); ctx.stroke(); } }
+  ctx.globalAlpha = 1;
+  const exit = E.iExpo(P(lt, 1.72, 2));
+  const bxp = lerp(tx0, tx1, lt > .75 ? val : 0) + exit * 1400;
+  const stretch = 1 + exit * 2.5;
+  ctx.fillStyle = ACC; ctx.beginPath(); ctx.ellipse(bxp - (stretch - 1) * 17, ty, 34 * stretch, 34 / Math.sqrt(stretch), 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = BG; ctx.font = M(16); ctx.letterSpacing = '3px'; ctx.globalAlpha = ta; ctx.fillText('SPACING CHART · 16 FRAMES', tx0, ty - 80); ctx.globalAlpha = 1;
+  // headline
+  const words = ['It’s', 'all', 'in', 'the', 'curve.']; ctx.font = D(128); ctx.letterSpacing = '-2px';
+  let x = tx0 - 6;
+  words.forEach((w, i) => { const line = i < 3 ? 0 : 1, base = 700 + line * 130; if (i === 3) x = tx0 - 6;
+    const p = E.oExpo(P(lt, .35 + i * .07, .95 + i * .07));
+    ctx.save(); ctx.beginPath(); ctx.rect(tx0 - 40, base - 120, 1000, 152); ctx.clip();
+    ctx.fillStyle = i === 4 ? ACC : BG; ctx.fillText(w, x, base + (1 - p) * 160); ctx.restore();
+    x += ctx.measureText(w + ' ').width; });
+  return BG;
+}
+
+// ---------- scene 6: loops montage ----------
+const CW = 560, CH = 330, GAP = 24, GX = (W - (3 * CW + 2 * GAP)) / 2, GY = (H - (2 * CH + GAP)) / 2 + 10;
+const LOOPS = [
+  ['SQUASH & STRETCH', (t) => { // bouncing ball
+    const per = .62, ph = (t % per) / per, hgt = Math.abs(Math.sin(Math.PI * ph)), g = CH - 70, y = g - hgt * 170 - 30;
+    const k = clamp(1 - hgt / .12), vel = Math.abs(Math.cos(Math.PI * ph)), st = 1 + .18 * vel * (1 - k);
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.beginPath(); ctx.ellipse(CW / 2, g + 2, 40 * (1 - hgt * .5), 8 * (1 - hgt * .5), 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = ACC; ctx.beginPath(); ctx.ellipse(CW / 2, y + 30 * k * .35, 30 * (1 + .35 * k) / st, 30 * (1 - .35 * k) * st, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = INK; ctx.globalAlpha = .25; ctx.beginPath(); ctx.moveTo(120, g + 32); ctx.lineTo(CW - 120, g + 32); ctx.stroke(); ctx.globalAlpha = 1; }],
+  ['HYPERCUBE', (t) => {
+    const a = t * 1.3, b = t * .9, pts = [];
+    for (const sc of [1, .5]) for (let i = 0; i < 8; i++) { let x = (i & 1 ? 1 : -1) * sc, y = (i & 2 ? 1 : -1) * sc, z = (i & 4 ? 1 : -1) * sc;
+      let x1 = x * Math.cos(a) - z * Math.sin(a), z1 = x * Math.sin(a) + z * Math.cos(a), y1 = y * Math.cos(b) - z1 * Math.sin(b), z2 = y * Math.sin(b) + z1 * Math.cos(b);
+      const f = 380 / (z2 + 4.2); pts.push([CW / 2 + x1 * f * .9, CH / 2 + 10 + y1 * f * .9]); }
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.beginPath();
+    for (const o of [0, 8]) for (let i = 0; i < 8; i++) for (const bit of [1, 2, 4]) { const j = i ^ bit; if (j > i) { ctx.moveTo(...pts[o + i]); ctx.lineTo(...pts[o + j]); } }
+    for (let i = 0; i < 8; i++) { ctx.moveTo(...pts[i]); ctx.lineTo(...pts[i + 8]); } ctx.stroke();
+    ctx.fillStyle = ACC; for (const p of pts) { ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, TAU); ctx.fill(); } }],
+  ['WAVEFORM', (t) => {
+    for (let r = 0; r < 13; r++) { const y0 = 80 + r * 17; ctx.beginPath(); ctx.moveTo(60, y0);
+      for (let x = 60; x <= CW - 60; x += 6) { const u = (x - 60) / (CW - 120), env = Math.pow(Math.sin(Math.PI * u), 3);
+        ctx.lineTo(x, y0 - env * (22 + 38 * (.5 + .5 * Math.sin(r * .9 + t * 2))) * (.5 + .5 * Math.sin(u * 14 - t * 6 + r * .6))); }
+      ctx.lineTo(CW - 60, y0 + 40); ctx.lineTo(60, y0 + 40); ctx.closePath(); ctx.fillStyle = CELL; ctx.fill();
+      ctx.strokeStyle = r === 6 ? ACC : INK; ctx.lineWidth = 2; ctx.stroke(); } }],
+  ['LOADERS', (t) => {
+    const cx = CW / 2, cy = CH / 2 + 12; ctx.lineCap = 'round';
+    [[100, ACC, 1.3, 10], [72, INK, -1.7, 8], [46, INK, 2.3, 6]].forEach(([r, c, sp, lw], i) => {
+      const cyc = (t * .9 + i * .21) % 1, a0 = E.io3(P(cyc, .45, 1)) * TAU * .8, a1 = E.io3(P(cyc, 0, .55)) * TAU * .8 + .15, rot = t * sp * 2 + cyc * TAU * .4;
+      ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.beginPath(); ctx.arc(cx, cy, r, rot + a0, rot + a1); ctx.stroke(); }); }],
+  ['VARIABLE TYPE', (t) => {
+    const wt = 500 + 400 * Math.sin(t * 5); ctx.fillStyle = INK; ctx.font = F(wt, 190); ctx.textAlign = 'center'; ctx.letterSpacing = '-6px';
+    ctx.fillText('Aa', CW / 2, CH / 2 + 78); ctx.font = M(16); ctx.letterSpacing = '2px'; ctx.fillStyle = ACC; ctx.textAlign = 'right';
+    ctx.fillText('wght ' + String(Math.round(wt)).padStart(3, '0'), CW - 28, CH - 26); ctx.textAlign = 'left'; }],
+  ['PENDULUM WAVE', (t) => {
+    const n = 17, pts = []; for (let i = 0; i < n; i++) { const w = 3 + i * .32, x = 70 + i * (CW - 140) / (n - 1), y = CH / 2 + 14 + Math.sin(t * w) * 95; pts.push([x, y]); }
+    ctx.strokeStyle = INK; ctx.globalAlpha = .35; ctx.lineWidth = 2; ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(...p) : ctx.moveTo(...p)); ctx.stroke(); ctx.globalAlpha = 1;
+    pts.forEach((p, i) => { ctx.fillStyle = i === 8 ? ACC : INK; ctx.beginPath(); ctx.arc(p[0], p[1], i === 8 ? 11 : 8, 0, TAU); ctx.fill(); }); }],
+];
+function s6(lt, dur, t) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const cam = E.oExpo(P(lt, 0, .7)), zoom = E.iExpo(P(lt, 1.5, 1.98)), target = 4;
+  const tcx = GX + (target % 3) * (CW + GAP) + CW / 2, tcy = GY + Math.floor(target / 3) * (CH + GAP) + CH / 2;
+  const zs = lerp(1, Math.max(W / CW, H / CH) * 1.08, zoom);
+  ctx.save();
+  ctx.translate(W / 2, H / 2); ctx.scale(lerp(1.35, 1, cam) * zs, lerp(1.35, 1, cam) * zs); ctx.rotate(lerp(.08, 0, cam));
+  ctx.translate(-lerp(W / 2, tcx, E.o3(clamp(zoom * 1.6))), -lerp(H / 2, tcy, E.o3(clamp(zoom * 1.6))));
+  const dirs = [[-1, 0], [0, -1], [1, 0], [-1, 0], [0, 1], [1, 0]];
+  LOOPS.forEach(([name, fn], i) => {
+    const p = E.oExpo(P(lt, i * .05, .55 + i * .05)), [dx, dy] = dirs[i];
+    const x = GX + (i % 3) * (CW + GAP) + dx * (1 - p) * 1300, y = GY + Math.floor(i / 3) * (CH + GAP) + dy * (1 - p) * 900;
+    ctx.save(); ctx.translate(x, y); ctx.beginPath(); ctx.roundRect(0, 0, CW, CH, 18); ctx.clip();
+    const fill = i === target ? zoom : 0;
+    ctx.fillStyle = CELL; ctx.fillRect(0, 0, CW, CH);
+    ctx.save(); fn(t); ctx.restore();
+    if (fill > 0) { ctx.globalAlpha = E.o3(fill); ctx.fillStyle = ACC; ctx.fillRect(0, 0, CW, CH); ctx.globalAlpha = 1; }
+    ctx.fillStyle = INK; ctx.globalAlpha = .7 * (1 - fill); ctx.font = M(14); ctx.letterSpacing = '3px'; ctx.textAlign = 'left';
+    ctx.fillText(`0${i + 1} — ${name}`, 24, 38); ctx.globalAlpha = 1;
+    ctx.restore();
+  });
+  ctx.restore();
+  return INK;
+}
+
+// ---------- scene 7: end card ----------
+function s7(lt) {
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  const x0 = 160, base = 560, s = 300, name = 'Claude';
+  ctx.font = F(800, s); ctx.letterSpacing = (-0.045 * s) + 'px';
+  const bx = capBox(F(800, s), name, (-0.045 * s) + 'px');
+  ctx.save(); ctx.beginPath(); ctx.rect(0, base - bx.a - 40, W, bx.a + 40 + bx.d + 10); ctx.clip();
+  let x = x0;
+  [...name].forEach((ch, i) => { const p = E.oExpo(P(lt, .02 + i * .045, .62 + i * .045)), wt = lerp(200, 800, E.io3(P(lt, .1 + i * .045, .7 + i * .045)));
+    ctx.font = F(wt, s); ctx.fillStyle = INK; ctx.fillText(ch, x, base + (1 - p) * (bx.a + 60));
+    ctx.font = F(800, s); x += ctx.measureText(ch).width; });
+  ctx.restore();
+  const dp = E.oBack(P(lt, .42, .72), 3.5);
+  if (dp > 0) { ctx.fillStyle = ACC; ctx.beginPath(); ctx.arc(x + 34, base - 30, 30 * dp, 0, TAU); ctx.fill(); }
+  // role
+  const rp = E.oExpo(P(lt, .35, .9));
+  ctx.save(); ctx.beginPath(); ctx.rect(0, base + 40, W, 120); ctx.clip();
+  ctx.font = D(84); ctx.fillStyle = INK; ctx.letterSpacing = '-1px'; ctx.fillText('Motion Designer', x0 + 6, base + 130 + (1 - rp) * 110);
+  ctx.restore();
+  // rule
+  const lp = E.oExpo(P(lt, .3, 1.1)); ctx.fillStyle = INK; ctx.globalAlpha = .28; ctx.letterSpacing = '0px'; ctx.fillRect(x0, 790, (W - 2 * x0) * lp, 2); ctx.globalAlpha = 1;
+  // meta columns
+  const cols = ['SHOWREEL 2026', '15 SEC · 900 FRAMES · 60 FPS', 'NO KEYFRAMES — JUST MATH', 'AVAILABLE FOR NEW WORK'];
+  ctx.font = M(18); ctx.letterSpacing = '3px';
+  cols.forEach((c, i) => { const p = E.o3(P(lt, .6 + i * .07, 1 + i * .07)); ctx.globalAlpha = p; ctx.fillStyle = INK;
+    const cx = [x0, x0 + 360, x0 + 860, W - x0 - ctx.measureText(c).width - 26][i]; ctx.fillText(c, cx + (i === 3 ? 26 : 0), 850 + (1 - p) * 24);
+    if (i === 3) { const pulse = .5 + .5 * Math.sin(lt * 9); ctx.fillStyle = ACC; ctx.globalAlpha = p * (.5 + .5 * pulse);
+      ctx.beginPath(); ctx.arc(cx + 7, 844 + (1 - p) * 24, 7, 0, TAU); ctx.fill(); } });
+  ctx.globalAlpha = 1;
+  // rotating badge
+  const bp = E.oBack(P(lt, .5, 1), 2), bcx = 1580, bcy = 330;
+  if (bp > 0) { ctx.save(); ctx.translate(bcx, bcy); ctx.scale(bp, bp); ctx.rotate(lt * .9 - (1 - bp) * 2);
+    const txt = 'MOTION · DESIGN · CODE · CRAFT · '; ctx.font = M(19); ctx.fillStyle = INK; ctx.letterSpacing = '0px'; ctx.textAlign = 'center';
+    const chars = [...txt]; chars.forEach((ch, i) => { ctx.save(); ctx.rotate(i / chars.length * TAU); ctx.fillText(ch, 0, -110); ctx.restore(); });
+    ctx.restore(); ctx.save(); ctx.translate(bcx, bcy); ctx.scale(bp, bp); ctx.rotate(-Math.PI / 4 + (1 - bp));
+    ctx.strokeStyle = ACC; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(-34, 0); ctx.lineTo(34, 0); ctx.moveTo(10, -24); ctx.lineTo(34, 0); ctx.lineTo(10, 24); ctx.stroke(); ctx.restore(); }
+  return INK;
+}
+
+// ---------- compositor ----------
+const SCENES = [[0, 2, s1, 'MOTION'], [2, 4, s2, 'PRINCIPLES'], [4, 6.5, s3, 'SYSTEMS'], [6.5, 9, s4, 'PARTICLES'],
+  [9, 11, s5, 'CURVES'], [11, 13, s6, 'LOOPS'], [13, 15, s7, 'HELLO']];
+const CUTS = [2, 4, 6.5, 9, 11, 13];
+function hud(t, i, col) {
+  const a = E.o3(P(t, .45, .9)); if (a <= 0) return;
+  ctx.globalAlpha = a * .9; ctx.fillStyle = col; ctx.strokeStyle = col; ctx.font = M(16); ctx.letterSpacing = '3px';
+  ctx.textAlign = 'left'; ctx.fillText('CLAUDE — REEL ’26', 72, 78);
+  const f = Math.round(t * FPS), tc = `00:00:${String(Math.floor(f / FPS)).padStart(2, '0')}:${String(f % FPS).padStart(2, '0')}`;
+  ctx.textAlign = 'right'; ctx.fillText(tc, W - 72, 78);
+  ctx.textAlign = 'left'; ctx.fillText(`${String(i + 1).padStart(2, '0')} / 07  ${SCENES[i][3]}`, 72, H - 62);
+  const bw = 220, bx0 = W - 72 - bw, by = H - 68; ctx.globalAlpha = a * .3; ctx.fillRect(bx0, by, bw, 2); ctx.globalAlpha = a * .9; ctx.fillRect(bx0, by - 1, bw * t / 15, 4);
+  ctx.lineWidth = 2; ctx.beginPath();
+  for (const [x, y, sx, sy] of [[40, 40, 1, 1], [W - 40, 40, -1, 1], [40, H - 40, 1, -1], [W - 40, H - 40, -1, -1]]) {
+    ctx.moveTo(x, y + sy * 18); ctx.lineTo(x, y); ctx.lineTo(x + sx * 18, y); }
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+window.renderFrame = function (t) {
+  reset(); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  let i = SCENES.findIndex(s => t >= s[0] && t < s[1]); if (i < 0) i = SCENES.length - 1;
+  const [a, b, fn] = SCENES[i];
+  const last = CUTS.filter(c => t >= c).pop(), dt = last === undefined ? 9 : t - last;
+  ctx.save();
+  if (dt < .28) { const k = Math.pow(1 - dt / .28, 3) * 16, z = 1 + 2.4 * k / H; ctx.translate(W / 2 + Math.sin(dt * 97) * k, H / 2 + Math.cos(dt * 71) * k * .6); ctx.scale(z, z); ctx.translate(-W / 2, -H / 2); }
+  const col = fn(t - a, b - a, t);
+  ctx.restore(); reset();
+  if (dt < .05) { ctx.globalAlpha = .22 * (1 - dt / .05); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  hud(t, i, col); reset();
+  // grain + vignette
+  const f = Math.round(t * FPS), r = rng(f * 7919);
+  ctx.save(); ctx.translate(-r() * 512, -r() * 512); ctx.fillStyle = GRAIN[f % 8]; ctx.fillRect(0, 0, W + 512, H + 512); ctx.restore();
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, H * 1.05);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.42)'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+};
+</script></body></html>

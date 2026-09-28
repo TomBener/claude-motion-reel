@@ -1,0 +1,14 @@
+{
+  "name": "claude-motion-reel",
+  "description": "A 15-second motion-graphics showreel rendered from code",
+  "scripts": {
+    "render": "node render.js all frames 6",
+    "audio": "python3 audio.py",
+    "encode": "ffmpeg -y -framerate 60 -i frames/f_%04d.png -i audio.wav -af volume=-2.5dB -vf \"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p\" -c:v libx264 -preset slow -crf 22 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -c:a aac -b:a 256k -shortest -movflags +faststart claude-motion-reel-2026.mp4"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer-core": "^25.12.0"
+  },
+  "private": true
+}

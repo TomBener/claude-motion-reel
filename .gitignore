@@ -1,0 +1,7 @@
+node_modules/
+frames/
+samples/
+fonts/
+*.mp4
+*.wav
+.DS_Store
